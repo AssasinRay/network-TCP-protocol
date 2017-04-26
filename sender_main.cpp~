@@ -1,0 +1,191 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <errno.h>
+#include <string.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netdb.h>
+#include <arpa/inet.h>
+#include <sys/wait.h>
+#include <signal.h>
+#include <string>
+#include <iostream>
+#include <sstream>
+#include <vector>
+#include <fstream> 
+#include <unordered_map>
+#include <unordered_set>
+#include "window.h"
+
+
+using namespace std;
+#define timeout 1
+
+//global variable
+int		global_socket_UDP;   				//udp socket
+struct addrinfo *p;
+socklen_t addrlen;
+struct sockaddr * address;
+
+FILE * 	file_ptr;							//file ptr
+vector<packet> file_buffer; 		//file buffer
+unsigned long long int sequence_end;							//the last sequence number
+
+// get sockaddr, IPv4 or IPv6:
+void *get_in_addr(struct sockaddr *sa)
+{
+	return sa->sa_family == AF_INET
+		? (void *) &(((struct sockaddr_in*)sa)->sin_addr)
+		: (void *) &(((struct sockaddr_in6*)sa)->sin6_addr);
+}
+
+/**
+set up sender UDP connection
+**/
+void set_up_socket(char* hostname, unsigned short int hostUDPport){
+	struct addrinfo hints, *servinfo;
+	int rv;
+	memset(&hints, 0, sizeof hints);
+	hints.ai_family = AF_UNSPEC;
+	hints.ai_socktype = SOCK_DGRAM;
+	char UDPport_str[17];
+	sprintf(UDPport_str, "%d", hostUDPport);
+	if ((rv = getaddrinfo(hostname, UDPport_str, &hints, &servinfo)) != 0) {
+	fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(rv));
+	return ;
+	}
+	// loop through all the results and connect to the first we can
+	for(p = servinfo; p != NULL; p = p->ai_next) {
+		if ((global_socket_UDP = socket(p->ai_family, p->ai_socktype,
+				p->ai_protocol)) == -1) {
+			perror("sender: socket");
+			continue;
+		}
+		addrlen = p->ai_addrlen;
+		address = p->ai_addr;
+		break;
+	}
+	if(p==NULL){
+		fprintf(stderr, "sender: failed to connect\n");
+		exit(1);
+        return ;
+	}
+	return;
+}
+
+void send_packet(char* buffer, int len){
+	int numBytes  = 0 ;
+	numBytes = sendto(global_socket_UDP,buffer,len,0,address,addrlen);
+	if(numBytes==-1){
+		perror("sender: send failed");
+		exit(1);
+	}
+	return ;
+}
+
+
+
+void reliablyTransfer(char* hostname, unsigned short int hostUDPport, char* filename, unsigned long long int bytesToTransfer) {
+	//read file content into file packet vector
+	file_buffer = read_file(filename, bytesToTransfer);
+	sequence_end	= file_buffer.size();
+	unordered_set<unsigned long long int>  			ack_state;  //insert send but not acked seqnum
+	unordered_map<unsigned long long int,struct timeval> 	time_state; //record time of sended packet
+
+
+	//set up socket connection
+	set_up_socket(hostname,hostUDPport);
+
+	//things for receiving acks
+	int bytesRecvd;
+	char recvBuf[50000];
+	memset(recvBuf, '\0', 50000);
+	struct sockaddr_in theirAddr;
+	socklen_t theirAddrLen;
+
+	window send_window(10, hostUDPport, hostname,0);
+	
+	//when window moves to the last pos and all packets are acked
+	while(send_window.start<sequence_end and ack_state.empty() )
+	{
+		//send data 
+		//print_window(send_window);
+		send_window.push_data(file_buffer);
+		std::cout<<"start: "<<send_window.start<<std::endl;
+		std::cout<<"end: "<<send_window.end<<std::endl;
+		send_window.prepare_send();
+		send_packet(send_window.payLoad_buffer, send_window.total_packet_size);
+
+		//record sended packet time and state seqnum
+		struct timeval now;
+		gettimeofday(&now, 0);
+		for(int idx = send_window.start;idx<send_window.end;idx++){
+			ack_state.insert(idx);
+			time_state[idx] = now;
+		}
+		
+		//wait for ack
+		theirAddrLen = sizeof(theirAddr);
+		if ((bytesRecvd = recvfrom(global_socket_UDP, recvBuf, 50000, 0, 
+			(struct sockaddr*)&theirAddr, &theirAddrLen)) == -1){
+			perror(" receiving ack failed");
+			exit(1);
+		}
+		
+		//get ack sequence number and ack packet and remove acked seqnum
+		vector<unsigned long long int> received_packet_seq = send_window.prepare_recv_ack(recvBuf,bytesRecvd);
+		for(int i=0;i<received_packet_seq.size();i++){
+			ack_state.erase(received_packet_seq[i]);
+			time_state.erase(received_packet_seq[i]);
+		}
+
+		//check timeout and resend packet
+		for(auto it=ack_state.begin();it!= ack_state.end();it++){
+			unsigned long long int not_ack_seqnum = *it;
+			struct timeval now;
+			gettimeofday(&now, 0);
+			if( now.tv_sec - time_state[not_ack_seqnum].tv_sec > timeout){
+				send_window.reprepare_packet(&file_buffer[not_ack_seqnum]);
+				send_packet(send_window.payLoad_buffer, send_window.total_packet_size);
+				time_state[not_ack_seqnum]=now;
+			}
+		}
+
+
+		//slide whole window to next position that this round's start = previous round's end
+		send_window.start= send_window.end;
+		send_window.end = min(send_window.start+send_window.window_size, sequence_end);
+		send_window.window_size = send_window.end - send_window.start;
+
+	}
+
+
+
+	//send ending signal
+	packet finish(2);
+	char* endbuf = packet_to_char(&finish);
+	send_packet(endbuf, packet_buffer_size);
+	delete endbuf;
+
+	std::cout<<"send finished and total packets are "<<file_buffer.size()<<std::endl;
+	close(global_socket_UDP);
+}
+
+int main(int argc, char** argv)
+{
+	unsigned short int udpPort;
+	unsigned long long int numBytes;
+	
+	if(argc != 5)
+	{
+		fprintf(stderr, "usage: %s receiver_hostname receiver_port filename_to_xfer bytes_to_xfer\n\n", argv[0]);
+		exit(1);
+	}
+	udpPort = (unsigned short int)atoi(argv[2]);
+	numBytes = atoll(argv[4]);
+	
+	std::cout<<"sending file "<<argv[3]<<" bytes of "<<numBytes<<" bytes to receiver "<<argv[1]<<":"<<udpPort<<std::endl;
+	reliablyTransfer(argv[1], udpPort, argv[3], numBytes);
+} 
