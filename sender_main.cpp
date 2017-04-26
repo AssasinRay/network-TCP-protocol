@@ -22,7 +22,7 @@
 
 
 using namespace std;
-#define timeout 0.5
+#define timeout 1
 
 //global variable
 int		global_socket_UDP;   				//udp socket
